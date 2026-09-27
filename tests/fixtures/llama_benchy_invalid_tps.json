@@ -1,0 +1,11 @@
+{
+  "version": "0.4.1.dev1",
+  "benchmarks": [
+    {
+      "concurrency": 1,
+      "context_size": 61440,
+      "pp_throughput": {"mean": 0, "std": 0, "values": []},
+      "tg_throughput": {"mean": null, "std": null, "values": []}
+    }
+  ]
+}

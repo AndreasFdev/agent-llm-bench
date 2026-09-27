@@ -1,0 +1,44 @@
+global:
+  artifact_root: ./artifacts
+  log_root: ./logs
+  temp_root: ./tmp
+
+nodes:
+  - id: inf-1
+    alias: nexus-bench-inf-1
+    os: windows
+    host: bench-node-1.local
+    ssh_user: benchmark
+    serving_port: 9191
+    probe_port: 19191
+    gpu_slot: "0"
+    model_dir: D:\\models\\bench
+    llama_server_path: D:\\llama.cpp\\llama-server.exe
+    llama_swap_config: D:\\llama-swap\\config.yaml
+    flash_attention: true
+
+  - id: inf-2
+    alias: nexus-bench-inf-2
+    os: linux
+    host: bench-node-2.local
+    ssh_user: benchmark
+    serving_port: 9292
+    probe_port: 19292
+    gpu_slot: "0"
+    model_dir: /models/bench
+    llama_server_path: /opt/llama.cpp/llama-server
+    llama_swap_config: /opt/llama-swap/config-9292.yaml
+    flash_attention: true
+
+  - id: inf-3
+    alias: nexus-bench-inf-3
+    os: linux
+    host: bench-node-2.local
+    ssh_user: benchmark
+    serving_port: 9393
+    probe_port: 19393
+    gpu_slot: "1"
+    model_dir: /models/bench
+    llama_server_path: /opt/llama.cpp/llama-server
+    llama_swap_config: /opt/llama-swap/config-9393.yaml
+    flash_attention: true

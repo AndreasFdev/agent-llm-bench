@@ -1,0 +1,17 @@
+{
+  "version": "0.4.1.dev1",
+  "timestamp": "2026-09-27 13:08:31Z",
+  "latency_mode": "generation",
+  "model": "nexus-bench-inf-2",
+  "benchmarks": [
+    {
+      "concurrency": 1,
+      "context_size": 61440,
+      "prompt_size": 2048,
+      "response_size": 32,
+      "pp_throughput": {"mean": 4860.35, "std": 1143.02, "values": [5729.49, 5606.13, 3245.44]},
+      "tg_throughput": {"mean": 92.90, "std": 7.58, "values": [102.92, 84.58, 91.21]},
+      "ttfr": {"mean": 14011.14, "std": 3941.90, "values": [11102.77, 11346.60, 19584.05]}
+    }
+  ]
+}

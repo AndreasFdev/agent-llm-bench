@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""Agent LLM Bench V0.3 Dashboard — stdlib http.server on configurable port (default 8083).
+
+No external dependencies. Reads from the V0.3 SQLite database and serves:
+- / : HTML dashboard
+- /api/runs : List of suite runs with aggregation
+- /api/runs/<suite_run_id> : Detail for a specific run
+- /api/benchmarks : Benchmark run list
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import sys
+from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+# Database path: same directory as this script (bench.db)
+DB_PATH = Path(__file__).parent.parent / "bench.db"
+
+
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        sys.stderr.write(f"[dashboard] {self.address_string()} - {format % args}\n")
+
+    def send_json(self, data, status=200):
+        body = json.dumps(data, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_html(self, html: str):
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        params = parse_qs(parsed.query)
+
+        try:
+            if path == "/" or path == "":
+                self.send_html(DASHBOARD_HTML)
+            elif path == "/api/runs":
+                self.handle_list_runs(params)
+            elif path.startswith("/api/runs/"):
+                suite_id = path[len("/api/runs/"):]
+                self.handle_run_detail(suite_id)
+            elif path == "/api/benchmarks":
+                self.handle_list_benchmarks(params)
+            else:
+                self.send_json({"error": "not found"}, 404)
+        except Exception as e:
+            self.send_json({"error": str(e)}, 500)
+
+    def handle_list_runs(self, params):
+        limit = int(params.get("limit", ["50"])[0])
+        model_name = params.get("model_name", [None])[0]
+
+        conn = get_conn()
+        try:
+            query = "SELECT * FROM suite_runs WHERE 1=1"
+            qparams = []
+            if model_name:
+                query += " AND model_name=?"
+                qparams.append(model_name)
+            query += " ORDER BY started_at DESC LIMIT ?"
+            qparams.append(limit)
+
+            rows = conn.execute(query, qparams).fetchall()
+            result = []
+            for row in rows:
+                run = dict(row)
+                # Aggregate benchmark counts
+                bench_counts = conn.execute(
+                    "SELECT status, COUNT(*) as cnt FROM benchmark_runs WHERE suite_run_id=? GROUP BY status",
+                    (run["suite_run_id"],),
+                ).fetchall()
+                total = sum(r["cnt"] for r in bench_counts)
+                completed = next((r["cnt"] for r in bench_counts if r["status"] == "completed"), 0)
+                failed = next((r["cnt"] for r in bench_counts if r["status"] == "failed"), 0)
+                run["total_benchmarks"] = total
+                run["completed"] = completed
+                run["failed"] = failed
+
+                # TTFT from llama_benchy_results @64k
+                ttft_row = conn.execute(
+                    """SELECT lbr.tg_tps FROM llama_benchy_results lbr
+                       JOIN benchmark_runs br ON lbr.benchmark_run_id = br.id
+                       WHERE br.suite_run_id=? AND lbr.n_ctx=64000
+                       ORDER BY br.started_at DESC LIMIT 1""",
+                    (run["suite_run_id"],),
+                ).fetchone()
+                run["ttft_64k_tps"] = ttft_row["tg_tps"] if ttft_row else None
+
+                # Avg accuracy from agent benchmarks
+                acc_rows = conn.execute(
+                    """SELECT br.result_json FROM benchmark_runs br
+                       WHERE br.suite_run_id=? AND br.benchmark_name IN ('agent_llm_bench','bfcl_v4','tau2')
+                       AND br.status='completed' AND br.result_json IS NOT NULL""",
+                    (run["suite_run_id"],),
+                ).fetchall()
+                accs = []
+                for ar in acc_rows:
+                    try:
+                        rj = json.loads(ar["result_json"])
+                        if "accuracy" in rj and rj["accuracy"] is not None:
+                            accs.append(rj["accuracy"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                run["avg_accuracy"] = (sum(accs) / len(accs)) if accs else None
+
+                result.append(run)
+            self.send_json(result)
+        finally:
+            conn.close()
+
+    def handle_run_detail(self, suite_id):
+        conn = get_conn()
+        try:
+            suite = conn.execute(
+                "SELECT * FROM suite_runs WHERE suite_run_id=?", (suite_id,)
+            ).fetchone()
+            if not suite:
+                self.send_json({"error": f"Suite {suite_id} not found"}, 404)
+                return
+
+            bench_runs = conn.execute(
+                "SELECT * FROM benchmark_runs WHERE suite_run_id=? ORDER BY started_at",
+                (suite_id,),
+            ).fetchall()
+
+            result = {
+                "suite": dict(suite),
+                "benchmarks": [dict(br) for br in bench_runs],
+            }
+            self.send_json(result)
+        finally:
+            conn.close()
+
+    def handle_list_benchmarks(self, params):
+        limit = int(params.get("limit", ["100"])[0])
+        suite_run_id = params.get("suite_run_id", [None])[0]
+        benchmark_name = params.get("benchmark_name", [None])[0]
+
+        conn = get_conn()
+        try:
+            query = "SELECT * FROM benchmark_runs WHERE 1=1"
+            qparams = []
+            if suite_run_id:
+                query += " AND suite_run_id=?"
+                qparams.append(suite_run_id)
+            if benchmark_name:
+                query += " AND benchmark_name=?"
+                qparams.append(benchmark_name)
+            query += " ORDER BY started_at DESC LIMIT ?"
+            qparams.append(limit)
+
+            rows = conn.execute(query, qparams).fetchall()
+            self.send_json([dict(r) for r in rows])
+        finally:
+            conn.close()
+
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent LLM Bench V0.3 Dashboard</title>
+    <style>
+        :root {
+            --bg: #0d1117; --card: #161b22; --border: #30363d;
+            --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+            --success: #3fb950; --warning: #d29922; --error: #f85149;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; padding: 2rem; }
+        h1 { font-size: 1.8rem; margin-bottom: 0.5rem; }
+        .subtitle { color: var(--muted); margin-bottom: 2rem; }
+        .error-banner { background: var(--error); color: white; padding: 1rem; border-radius: 6px; margin-bottom: 1.5rem; display: none; }
+        table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+        th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--border); }
+        th { background: #21262d; font-weight: 600; color: var(--muted); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }
+        tr:hover { background: #1c2128; }
+        .status { padding: 0.2rem 0.6rem; border-radius: 12px; font-size: 0.8rem; font-weight: 600; }
+        .status-completed { background: rgba(63,185,80,0.2); color: var(--success); }
+        .status-running { background: rgba(88,166,255,0.2); color: var(--accent); }
+        .status-failed { background: rgba(248,81,73,0.2); color: var(--error); }
+        .status-timeout { background: rgba(210,153,34,0.2); color: var(--warning); }
+        .metric { font-variant-numeric: tabular-nums; }
+        .model-name { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .refresh-btn { background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; margin-bottom: 1rem; }
+        .refresh-btn:hover { border-color: var(--accent); }
+    </style>
+</head>
+<body>
+    <h1>Agent LLM Bench V0.3</h1>
+    <p class="subtitle">Local-first benchmark orchestration for Nexus Hermes-agent model evaluation</p>
+    <div id="error-banner" class="error-banner"></div>
+    <button class="refresh-btn" onclick="loadRuns()">↻ Refresh</button>
+    <table id="runs-table">
+        <thead>
+            <tr>
+                <th>Suite ID</th><th>Model</th><th>Node</th><th>Status</th>
+                <th>Benchmarks</th><th>TTFT @64k (tok/s)</th><th>Avg Accuracy</th>
+                <th>Started</th><th>Duration</th>
+            </tr>
+        </thead>
+        <tbody id="runs-body"><tr><td colspan="9">Loading...</td></tr></tbody>
+    </table>
+    <script>
+        function fmtDur(sec) { if (sec == null) return '-'; const m = Math.floor(sec/60); const s = Math.floor(sec%60); return m > 0 ? m+'m '+s+'s' : s+'s'; }
+        function fmtDate(iso) { if (!iso) return '-'; return iso.replace('T',' ').substring(0,19); }
+        function statusCls(s) { const m={'completed':'status-completed','running':'status-running','failed':'status-failed','timeout':'status-timeout'}; return m[s]||'status-running'; }
+        async function loadRuns() {
+            const tbody = document.getElementById('runs-body');
+            const eb = document.getElementById('error-banner');
+            eb.style.display='none';
+            tbody.innerHTML='<tr><td colspan="9">Loading...</td></tr>';
+            try {
+                const resp = await fetch('/api/runs?limit=50');
+                if (!resp.ok) throw new Error('HTTP '+resp.status);
+                const runs = await resp.json();
+                if (runs.length===0) { tbody.innerHTML='<tr><td colspan="9">No suite runs found</td></tr>'; return; }
+                tbody.innerHTML = runs.map(r => `
+                    <tr>
+                        <td class="metric">${r.suite_run_id}</td>
+                        <td class="model-name" title="${r.model_name}">${r.model_name}</td>
+                        <td>${r.node_id}</td>
+                        <td><span class="status ${statusCls(r.status)}">${r.status}</span></td>
+                        <td class="metric">${r.completed}/${r.total_benchmarks}</td>
+                        <td class="metric">${r.ttft_64k_tps ? r.ttft_64k_tps.toFixed(1) : '-'}</td>
+                        <td class="metric">${r.avg_accuracy != null ? (r.avg_accuracy*100).toFixed(1)+'%' : '-'}</td>
+                        <td>${fmtDate(r.started_at)}</td>
+                        <td class="metric">${fmtDur(r.total_duration_sec)}</td>
+                    </tr>`).join('');
+            } catch (err) {
+                eb.textContent = 'Error: '+err.message; eb.style.display='block';
+                tbody.innerHTML='<tr><td colspan="9">Failed to load</td></tr>';
+            }
+        }
+        loadRuns();
+    </script>
+</body>
+</html>"""
+
+
+def main():
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8083
+    host = "0.0.0.0"
+
+    # Ensure DB exists and is initialized
+    from agent_llm_bench_v03.storage.database import Database
+    db = Database(DB_PATH)
+    db.initialize()
+    db.close()
+
+    server = HTTPServer((host, port), DashboardHandler)
+    print(f"Agent LLM Bench V0.3 Dashboard running on http://{host}:{port}")
+    sys.stderr.write(f"[dashboard] Listening on {host}:{port}\n")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()
